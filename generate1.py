@@ -207,37 +207,40 @@ def _init_logging(rank):
 
 
 def generate(args):
+    # 确保 GPU 可用
+    if not torch.cuda.is_available():
+        raise RuntimeError("No GPU found! Please enable GPU in Kaggle settings.")
+
+    # 设置 GPU 设备
+    torch.backends.cudnn.benchmark = True  # 让 PyTorch 选择最佳的算法
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
+    
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(local_rank)  # 确保正确的 CUDA 设备
+
     _init_logging(rank)
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
-        logging.info(
-            f"offload_model is not specified, set to {args.offload_model}.")
+        logging.info(f"offload_model is not specified, set to {args.offload_model}.")
+
     if world_size > 1:
-        torch.cuda.set_device(local_rank)
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
             rank=rank,
-            world_size=world_size)
+            world_size=world_size
+        )
     else:
-        assert not (
-            args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1 or args.ring_size > 1
-        ), f"context parallel are not supported in non-distributed environments."
+        assert not (args.t5_fsdp or args.dit_fsdp), "t5_fsdp and dit_fsdp are not supported in non-distributed environments."
+        assert not (args.ulysses_size > 1 or args.ring_size > 1), "context parallel is not supported in non-distributed environments."
 
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
-        from xfuser.core.distributed import (initialize_model_parallel,
-                                             init_distributed_environment)
-        init_distributed_environment(
-            rank=dist.get_rank(), world_size=dist.get_world_size())
+        from xfuser.core.distributed import (initialize_model_parallel, init_distributed_environment)
+        init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
 
         initialize_model_parallel(
             sequence_parallel_degree=dist.get_world_size(),
@@ -247,16 +250,11 @@ def generate(args):
 
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
-            prompt_expander = DashScopePromptExpander(
-                model_name=args.prompt_extend_model, is_vl="i2v" in args.task)
+            prompt_expander = DashScopePromptExpander(model_name=args.prompt_extend_model, is_vl="i2v" in args.task)
         elif args.prompt_extend_method == "local_qwen":
-            prompt_expander = QwenPromptExpander(
-                model_name=args.prompt_extend_model,
-                is_vl="i2v" in args.task,
-                device=rank)
+            prompt_expander = QwenPromptExpander(model_name=args.prompt_extend_model, is_vl="i2v" in args.task, device=rank)
         else:
-            raise NotImplementedError(
-                f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+            raise NotImplementedError(f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
 
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
@@ -277,13 +275,9 @@ def generate(args):
         if args.use_prompt_extend:
             logging.info("Extending prompt ...")
             if rank == 0:
-                prompt_output = prompt_expander(
-                    args.prompt,
-                    tar_lang=args.prompt_extend_target_lang,
-                    seed=args.base_seed)
+                prompt_output = prompt_expander(args.prompt, tar_lang=args.prompt_extend_target_lang, seed=args.base_seed)
                 if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
+                    logging.info(f"Extending prompt failed: {prompt_output.message}")
                     logging.info("Falling back to original prompt.")
                     input_prompt = args.prompt
                 else:
@@ -308,8 +302,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
         )
 
-        logging.info(
-            f"Generating {'image' if 't2i' in args.task else 'video'} ...")
+        logging.info(f"Generating {'image' if 't2i' in args.task else 'video'} ...")
         video = wan_t2v.generate(
             args.prompt,
             size=SIZE_CONFIGS[args.size],
@@ -319,7 +312,8 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model
+        )
 
     else:
         if args.prompt is None:
@@ -330,28 +324,6 @@ def generate(args):
         logging.info(f"Input image: {args.image}")
 
         img = Image.open(args.image).convert("RGB")
-        if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
-            if rank == 0:
-                prompt_output = prompt_expander(
-                    args.prompt,
-                    tar_lang=args.prompt_extend_target_lang,
-                    image=img,
-                    seed=args.base_seed)
-                if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
-                    input_prompt = args.prompt
-                else:
-                    input_prompt = prompt_output.prompt
-                input_prompt = [input_prompt]
-            else:
-                input_prompt = [None]
-            if dist.is_initialized():
-                dist.broadcast_object_list(input_prompt, src=0)
-            args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
@@ -376,33 +348,23 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model
+        )
 
     if rank == 0:
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/",
-                                                                     "_")[:50]
+            formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
             suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            args.save_file = f"{args.task}_{args.size.replace('*','x')}_{formatted_prompt}_{formatted_time}{suffix}"
 
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")
-            cache_image(
-                tensor=video.squeeze(1)[None],
-                save_file=args.save_file,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1))
+            cache_image(tensor=video.squeeze(1)[None], save_file=args.save_file, nrow=1, normalize=True, value_range=(-1, 1))
         else:
             logging.info(f"Saving generated video to {args.save_file}")
-            cache_video(
-                tensor=video[None],
-                save_file=args.save_file,
-                fps=cfg.sample_fps,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1))
+            cache_video(tensor=video[None], save_file=args.save_file, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
+
     logging.info("Finished.")
 
 
